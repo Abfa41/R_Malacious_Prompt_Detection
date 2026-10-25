@@ -1,0 +1,328 @@
+---
+jupyter:
+  accelerator: GPU
+  colab:
+    gpuType: T4
+  kernelspec:
+    display_name: R
+    name: ir
+  language_info:
+    name: R
+  nbformat: 4
+  nbformat_minor: 0
+---
+
+::: {.cell .code colab="{\"base_uri\":\"https://localhost:8080/\"}" id="HTtc2mQFx-9O" outputId="ebceac7e-4519-4259-c587-d51855e830e9"}
+``` python
+install.packages(c("tidyverse", "tm", "caret", "e1071", "randomForest", "Matrix"))
+install.packages("quanteda")
+install.packages("quanteda.textstats")
+```
+
+::: {.output .stream .stderr}
+    Installing packages into ‘/usr/local/lib/R/site-library’
+    (as ‘lib’ is unspecified)
+
+    also installing the dependencies ‘listenv’, ‘parallelly’, ‘future’, ‘globals’, ‘shape’, ‘future.apply’, ‘numDeriv’, ‘progressr’, ‘SQUAREM’, ‘diagram’, ‘lava’, ‘prodlim’, ‘iterators’, ‘clock’, ‘gower’, ‘hardhat’, ‘ipred’, ‘sparsevctrs’, ‘timeDate’, ‘NLP’, ‘slam’, ‘BH’, ‘foreach’, ‘ModelMetrics’, ‘plyr’, ‘pROC’, ‘recipes’, ‘reshape2’, ‘proxy’
+
+
+    Installing package into ‘/usr/local/lib/R/site-library’
+    (as ‘lib’ is unspecified)
+
+    also installing the dependencies ‘ISOcodes’, ‘fastmatch’, ‘SnowballC’, ‘stopwords’
+
+
+    Installing package into ‘/usr/local/lib/R/site-library’
+    (as ‘lib’ is unspecified)
+
+    also installing the dependencies ‘nsyllable’, ‘proxyC’, ‘RcppArmadillo’
+:::
+:::
+
+::: {.cell .code colab="{\"base_uri\":\"https://localhost:8080/\"}" id="ENFs8gnc3pEx" outputId="af8694e9-2a12-470a-be05-8853e91608a2"}
+``` python
+# ==========================================
+# 0. LOAD REQUIRED LIBRARIES
+# ==========================================
+library(tidyverse)
+library(quanteda)
+library(quanteda.textstats)
+library(caret)
+library(e1071)
+library(randomForest)
+library(Matrix)
+
+# ==========================================
+# 1. DATA CLEANING & PREPROCESSING
+# ==========================================
+
+clean_text <- function(text) {
+  text <- str_to_lower(text)
+  text <- str_replace_all(text, "\\s+", " ")
+  text <- str_trim(text)
+  return(text)
+}
+
+extra_features <- function(text) {
+  n_chars <- nchar(text)
+  n_exclam <- str_count(text, "!")
+  n_quest  <- str_count(text, "\\?")
+  n_upper  <- str_count(text, "[A-Z]")
+  return(c(n_chars, n_exclam, n_quest, n_upper))
+}
+
+# Load training data
+train_df_original <- read.csv("merged_train_70.csv", stringsAsFactors = FALSE)
+train_df <- train_df_original %>%
+  select(Prompt, isMalicious) %>%
+  drop_na() %>%
+  rename(text = Prompt, label = isMalicious) %>%
+  mutate(text = clean_text(text))
+
+# Load test data
+test_df_original <- read.csv("merged_test_30.csv", stringsAsFactors = FALSE, fileEncoding = "UTF-8")
+test_df <- test_df_original %>%
+  select(Prompt, isMalicious) %>%
+  drop_na() %>%
+  rename(text = Prompt, label = isMalicious) %>%
+  mutate(text = clean_text(text))
+
+
+# ==========================================
+# 2. FEATURE ENGINEERING (QUANTEDA TF-IDF)
+# ==========================================
+
+cat("Building Training Features...\n")
+corp_train <- corpus(train_df, text_field = "text")
+toks_train <- tokens(corp_train, remove_punct = TRUE, remove_numbers = TRUE)
+dfm_train <- dfm(toks_train)
+
+# Trim more aggressively to keep feature size lightweight and memory-efficient
+dfm_train <- dfm_trim(dfm_train, min_termfreq = 10, termfreq_type = "count")
+dfm_train <- dfm_tfidf(dfm_train)
+
+extra_train_mat <- t(sapply(train_df$text, extra_features))
+colnames(extra_train_mat) <- c("Extra_Length", "Extra_Exclam", "Extra_Quest", "Extra_Upper")
+
+# Combine matrices
+X_train <- cbind(as.matrix(dfm_train), extra_train_mat)
+y_train <- as.factor(train_df$label)
+
+cat("Processing Test Features...\n")
+corp_test <- corpus(test_df, text_field = "text")
+toks_test <- tokens(corp_test, remove_punct = TRUE, remove_numbers = TRUE)
+dfm_test <- dfm(toks_test)
+dfm_test <- dfm_match(dfm_test, featnames(dfm_train))
+dfm_test <- dfm_tfidf(dfm_test)
+
+extra_test_mat <- t(sapply(test_df$text, extra_features))
+colnames(extra_test_mat) <- c("Extra_Length", "Extra_Exclam", "Extra_Quest", "Extra_Upper")
+X_test <- cbind(as.matrix(dfm_test), extra_test_mat)
+y_test <- as.factor(test_df$label)
+
+# Safe alternative for zero-variance column removal using apply
+col_vars <- apply(X_train, 2, var)
+X_train <- X_train[, col_vars > 0, drop = FALSE]
+X_test <- X_test[, colnames(X_train), drop = FALSE]
+
+cat("Train shape (after cleaning):", dim(X_train), "\n")
+cat("Validation shape:", dim(X_test), "\n")
+
+
+# ==========================================
+# 3. MODEL TRAINING & EVALUATION
+# ==========================================
+
+evaluate_model <- function(preds, actual) {
+  cm <- confusionMatrix(preds, actual, positive = "1")
+  acc <- cm$overall["Accuracy"]
+  prec <- cm$byClass["Precision"]
+  rec <- cm$byClass["Recall"]
+  f1 <- cm$byClass["F1"]
+  return(list(Accuracy = acc, Precision = prec, Recall = rec, F1 = f1))
+}
+
+# --- A. Logistic Regression ---
+cat("Training Logistic Regression...\n")
+lr_model <- train(X_train, y_train, method = "glm", family = binomial(),
+                  trControl = trainControl(method = "none"))
+pred_lr <- predict(lr_model, X_test)
+metrics_lr <- evaluate_model(pred_lr, y_test)
+print(metrics_lr)
+
+# --- B. Linear SVM ---
+cat("Training Linear SVM...\n")
+svm_model <- svm(X_train, y_train, kernel = "linear", cost = 1, scale = TRUE)
+pred_svm <- predict(svm_model, X_test)
+metrics_svm <- evaluate_model(pred_svm, y_test)
+print(metrics_svm)
+
+# --- C. Random Forest ---
+cat("Training Random Forest...\n")
+rf_model <- randomForest(X_train, y_train, ntree = 100, mtry = floor(sqrt(ncol(X_train))))
+pred_rf <- predict(rf_model, X_test)
+metrics_rf <- evaluate_model(pred_rf, y_test)
+print(metrics_rf)
+
+
+# ==========================================
+# 4. BEST MODEL SELECTION & FINAL PREDICTIONS
+# ==========================================
+
+scores <- c("Logistic Regression" = metrics_lr$F1,
+            "Linear SVM" = metrics_svm$F1,
+            "Random Forest" = metrics_rf$F1)
+
+best_model_name <- names(which.max(scores))
+cat("\nBest Model Selected:", best_model_name, "with F1 Score:", max(scores), "\n")
+
+if (best_model_name == "Linear SVM") {
+  final_predictions <- pred_svm
+} else if (best_model_name == "Logistic Regression") {
+  final_predictions <- pred_lr
+} else {
+  final_predictions <- pred_rf
+}
+
+# Export output submission file
+output_df <- data.frame(text = test_df$text, predicted_label = final_predictions)
+write.csv(output_df, "predicted_output.csv", row.names = FALSE)
+cat("Prediction file successfully saved as 'predicted_output.csv'!\n")
+```
+
+::: {.output .stream .stderr}
+    ── Attaching core tidyverse packages ──────────────────────── tidyverse 2.0.0 ──
+    ✔ dplyr     1.2.1     ✔ readr     2.2.0
+    ✔ forcats   1.0.1     ✔ stringr   1.6.0
+    ✔ ggplot2   4.0.3     ✔ tibble    3.3.1
+    ✔ lubridate 1.9.5     ✔ tidyr     1.3.2
+    ✔ purrr     1.2.2     
+    ── Conflicts ────────────────────────────────────────── tidyverse_conflicts() ──
+    ✖ dplyr::filter() masks stats::filter()
+    ✖ dplyr::lag()    masks stats::lag()
+    ℹ Use the conflicted package (<http://conflicted.r-lib.org/>) to force all conflicts to become errors
+    Package version: 4.5.0
+    Unicode version: 15.1
+    ICU version: 74.2
+
+    Parallel computing: disabled
+
+    See https://quanteda.io for tutorials and examples.
+
+    Loading required package: lattice
+
+
+    Attaching package: ‘caret’
+
+
+    The following object is masked from ‘package:purrr’:
+
+        lift
+
+
+
+    Attaching package: ‘e1071’
+
+
+    The following object is masked from ‘package:ggplot2’:
+
+        element
+
+
+    randomForest 4.7-1.2
+
+    Type rfNews() to see new features/changes/bug fixes.
+
+
+    Attaching package: ‘randomForest’
+
+
+    The following object is masked from ‘package:dplyr’:
+
+        combine
+
+
+    The following object is masked from ‘package:ggplot2’:
+
+        margin
+
+
+
+    Attaching package: ‘Matrix’
+
+
+    The following object is masked from ‘package:quanteda’:
+
+        drop0
+
+
+    The following objects are masked from ‘package:tidyr’:
+
+        expand, pack, unpack
+:::
+
+::: {.output .stream .stdout}
+    Building Training Features...
+    Processing Test Features...
+    Train shape (after cleaning): 19517 6314 
+    Validation shape: 11703 6314 
+    Training Logistic Regression...
+:::
+:::
+
+::: {.cell .markdown id="Dc5wH9TxYZ0Y"}
+## Visualizations
+:::
+
+::: {.cell .code id="2OCFeAzVYcvF"}
+``` python
+# Create a dataframe of your model results
+model_results <- data.frame(
+  Model = c("Logistic Regression", "Linear SVM", "Random Forest"),
+  F1_Score = c(0.9337545, 0.9408377, 0.9560081), # Replace with your exact logged values
+  Accuracy = c(0.9336922, 0.9420661, 0.9573614)
+)
+
+library(ggplot2)
+ggplot(model_results, aes(x = Model, y = F1_Score, fill = Model)) +
+  geom_bar(stat = "identity", width = 0.6) +
+  ylim(0, 1) +
+  theme_minimal() +
+  labs(title = "Model Performance Comparison (F1-Score)",
+       y = "F1 Score", x = "Classifier") +
+  theme(legend.position = "none")
+```
+:::
+
+::: {.cell .code id="kMAOuAN9Ydu0"}
+``` python
+# Assuming 'pred_rf' contains your predictions and 'y_test' contains actuals
+cm <- table(Actual = y_test, Predicted = pred_rf)
+
+# Convert to dataframe for ggplot heatmap
+cm_df <- as.data.frame(cm)
+
+ggplot(cm_df, aes(x = Predicted, y = Actual, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = Freq), color = "white", size = 6) +
+  scale_fill_gradient(low = "lightblue", high = "darkblue") +
+  theme_minimal() +
+  labs(title = "Confusion Matrix - Random Forest",
+       x = "Predicted Label", y = "Actual Label")
+```
+:::
+
+::: {.cell .code id="gY8r-MwyYgSn"}
+``` python
+ggplot(train_df, aes(x = nchar(text), fill = as.factor(label))) +
+  geom_histogram(bins = 50, alpha = 0.6, position = "identity") +
+  theme_minimal() +
+  labs(title = "Prompt Length Distribution by Class",
+       x = "Character Length", y = "Count", fill = "Is Malicious")
+```
+:::
+
+::: {.cell .code id="qNcYFdQJYjCs"}
+``` python
+```
+:::
